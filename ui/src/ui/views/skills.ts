@@ -28,14 +28,26 @@ type SkillSourceKind = "workspace" | "managed" | "bundled" | "other";
 
 type SkillStatusKind = "enabled" | "disabled" | "blocked" | "ineligible";
 
-function resolveSkillSourceKind(report: SkillStatusReport | null, skill: SkillStatusEntry): SkillSourceKind {
+function resolveSkillSourceKind(
+  report: SkillStatusReport | null,
+  skill: SkillStatusEntry,
+): SkillSourceKind {
   const base = skill.baseDir || "";
   const workspace = report?.workspaceDir || "";
   const managed = report?.managedSkillsDir || "";
+  const source = (skill.source || "").toLowerCase();
 
-  if (workspace && base.startsWith(workspace)) return "workspace";
-  if (managed && base.startsWith(managed)) return "managed";
-  if (skill.source) return "bundled";
+  // Guard against misconfigured/empty roots (e.g. workspaceDir="/") which would match everything.
+  const isValidRoot = (p: string) => Boolean(p) && p !== "/";
+
+  if (isValidRoot(workspace) && base.startsWith(workspace)) return "workspace";
+  if (isValidRoot(managed) && base.startsWith(managed)) return "managed";
+
+  // Bundled/built-in skills typically have a source string like "clawdbot-bundled".
+  if (source.includes("bundled")) return "bundled";
+  // Managed/ClawdHub-installed skills may include clawdhub in the source string.
+  if (source.includes("clawdhub")) return "managed";
+
   return "other";
 }
 
