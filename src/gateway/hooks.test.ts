@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { MoltbotConfig } from "../config/config.js";
 import type { ChannelPlugin } from "../channels/plugins/types.js";
@@ -8,8 +9,12 @@ import {
   extractHookToken,
   normalizeAgentPayload,
   normalizeWakePayload,
+  parseJsonBody,
+  readRawBody,
   resolveHooksConfig,
+  verifyWebhook,
 } from "./hooks.js";
+import type { HookMappingResolved } from "./hooks-mapping.js";
 
 describe("gateway hooks helpers", () => {
   beforeEach(() => {
@@ -149,4 +154,107 @@ const createMSTeamsPlugin = (params: { aliases?: string[] }): ChannelPlugin => (
     listAccountIds: () => [],
     resolveAccount: () => ({}),
   },
+});
+
+describe("readRawBody and parseJsonBody", () => {
+  test("readRawBody reads stream into buffer", async () => {
+    const req = Readable.from([
+      Buffer.from('{"foo":'),
+      Buffer.from('"bar"}'),
+    ]) as unknown as IncomingMessage;
+    const result = await readRawBody(req, 1024);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.toString()).toBe('{"foo":"bar"}');
+    }
+  });
+
+  test("parseJsonBody parses valid JSON", () => {
+    const result = parseJsonBody(Buffer.from('{"hello":"world"}'));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual({ hello: "world" });
+    }
+  });
+
+  test("parseJsonBody returns empty object for empty buffer", () => {
+    const result = parseJsonBody(Buffer.from(""));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual({});
+    }
+  });
+
+  test("parseJsonBody rejects invalid JSON", () => {
+    const result = parseJsonBody(Buffer.from("not json"));
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("verifyWebhook", () => {
+  function createMockRequest(body: string, headers: Record<string, string> = {}): IncomingMessage {
+    const readable = new Readable({
+      read() {
+        this.push(Buffer.from(body));
+        this.push(null);
+      },
+    });
+    return Object.assign(readable, { headers }) as unknown as IncomingMessage;
+  }
+
+  test("verifyWebhook with valid token succeeds", async () => {
+    const req = createMockRequest('{"message":"hello"}', {
+      authorization: "Bearer secret123",
+    });
+    const result = await verifyWebhook({
+      req,
+      url: new URL("http://localhost/hooks/test"),
+      subPath: "test",
+      headers: { authorization: "Bearer secret123" },
+      mappings: [],
+      expectedToken: "secret123",
+      maxBodyBytes: 1024,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.payload).toEqual({ message: "hello" });
+      expect(result.tokenFromQuery).toBe(false);
+    }
+  });
+
+  test("verifyWebhook with invalid token fails", async () => {
+    const req = createMockRequest('{"message":"hello"}', {
+      authorization: "Bearer wrong",
+    });
+    const result = await verifyWebhook({
+      req,
+      url: new URL("http://localhost/hooks/test"),
+      subPath: "test",
+      headers: { authorization: "Bearer wrong" },
+      mappings: [],
+      expectedToken: "secret123",
+      maxBodyBytes: 1024,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(401);
+    }
+  });
+
+  test("verifyWebhook with query token sets tokenFromQuery", async () => {
+    const req = createMockRequest('{"message":"hello"}', {});
+    const result = await verifyWebhook({
+      req,
+      url: new URL("http://localhost/hooks/test?token=secret123"),
+      subPath: "test",
+      headers: {},
+      mappings: [],
+      expectedToken: "secret123",
+      maxBodyBytes: 1024,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.tokenFromQuery).toBe(true);
+    }
+  });
 });

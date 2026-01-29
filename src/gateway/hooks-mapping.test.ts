@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { applyHookMappings, resolveHookMappings } from "./hooks-mapping.js";
+import { applyHookMappings, findMappingVerifyAuth, resolveHookMappings } from "./hooks-mapping.js";
 
 const baseUrl = new URL("http://127.0.0.1:18789/hooks/gmail");
 
@@ -164,5 +164,120 @@ describe("hooks mapping", () => {
       path: "noop",
     });
     expect(result?.ok).toBe(false);
+  });
+});
+
+describe("findMappingVerifyAuth", () => {
+  it("returns null when no mappings", async () => {
+    const result = await findMappingVerifyAuth([], "github");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when mapping has no transform", async () => {
+    const mappings = resolveHookMappings({
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          messageTemplate: "test",
+        },
+      ],
+    });
+    const result = await findMappingVerifyAuth(mappings, "github");
+    expect(result).toBeNull();
+  });
+
+  it("returns null when transform has no verifyAuth export", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moltbot-hooks-noauth-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(modPath, "export default () => ({ message: 'test' });");
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await findMappingVerifyAuth(mappings, "github");
+    expect(result).toBeNull();
+  });
+
+  it("returns verifyAuth function when exported", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moltbot-hooks-auth-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(
+      modPath,
+      `
+      export function verifyAuth(ctx) {
+        return ctx.headers["x-secret"] === "valid";
+      }
+      export default () => ({ message: 'test' });
+      `,
+    );
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await findMappingVerifyAuth(mappings, "github");
+    expect(result).not.toBeNull();
+    expect(typeof result).toBe("function");
+
+    // Test the verifyAuth function works
+    if (result) {
+      const valid = await result({
+        headers: { "x-secret": "valid" },
+        url: new URL("http://localhost/hooks/github"),
+        path: "github",
+        rawBody: Buffer.from("{}"),
+      });
+      expect(valid).toBe(true);
+
+      const invalid = await result({
+        headers: { "x-secret": "wrong" },
+        url: new URL("http://localhost/hooks/github"),
+        path: "github",
+        rawBody: Buffer.from("{}"),
+      });
+      expect(invalid).toBe(false);
+    }
+  });
+
+  it("does not match mapping with different path", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moltbot-hooks-path-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(
+      modPath,
+      `
+      export function verifyAuth() { return true; }
+      export default () => ({ message: 'test' });
+      `,
+    );
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await findMappingVerifyAuth(mappings, "stripe");
+    expect(result).toBeNull();
   });
 });
