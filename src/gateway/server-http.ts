@@ -15,16 +15,15 @@ import { handleSlackHttpRequest } from "../slack/http/index.js";
 import { resolveAgentAvatar } from "../agents/identity-avatar.js";
 import { handleControlUiAvatarRequest, handleControlUiHttpRequest } from "./control-ui.js";
 import {
-  extractHookToken,
   getHookChannelError,
   type HookMessageChannel,
   type HooksConfigResolved,
   normalizeAgentPayload,
   normalizeHookHeaders,
   normalizeWakePayload,
-  readJsonBody,
   resolveHookChannel,
   resolveHookDeliver,
+  verifyWebhook,
 } from "./hooks.js";
 import { applyHookMappings } from "./hooks-mapping.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
@@ -76,21 +75,6 @@ export function createHooksRequestHandler(
       return false;
     }
 
-    const { token, fromQuery } = extractHookToken(req, url);
-    if (!token || token !== hooksConfig.token) {
-      res.statusCode = 401;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Unauthorized");
-      return true;
-    }
-    if (fromQuery) {
-      logHooks.warn(
-        "Hook token provided via query parameter is deprecated for security reasons. " +
-          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
-          "Use Authorization: Bearer <token> or X-Moltbot-Token header instead.",
-      );
-    }
-
     if (req.method !== "POST") {
       res.statusCode = 405;
       res.setHeader("Allow", "POST");
@@ -107,15 +91,39 @@ export function createHooksRequestHandler(
       return true;
     }
 
-    const body = await readJsonBody(req, hooksConfig.maxBodyBytes);
-    if (!body.ok) {
-      const status = body.error === "payload too large" ? 413 : 400;
-      sendJson(res, status, { ok: false, error: body.error });
+    const headers = normalizeHookHeaders(req);
+
+    // Verify authentication (custom verifyAuth or token) and parse body
+    const verified = await verifyWebhook({
+      req,
+      url,
+      subPath,
+      headers,
+      mappings: hooksConfig.mappings,
+      expectedToken: hooksConfig.token,
+      maxBodyBytes: hooksConfig.maxBodyBytes,
+    });
+
+    if (!verified.ok) {
+      if (verified.status === 401) {
+        res.statusCode = 401;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("Unauthorized");
+      } else {
+        sendJson(res, verified.status, { ok: false, error: verified.error });
+      }
       return true;
     }
 
-    const payload = typeof body.value === "object" && body.value !== null ? body.value : {};
-    const headers = normalizeHookHeaders(req);
+    if (verified.tokenFromQuery) {
+      logHooks.warn(
+        "Hook token provided via query parameter is deprecated for security reasons. " +
+          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
+          "Use Authorization: Bearer <token> or X-Moltbot-Token header instead.",
+      );
+    }
+
+    const payload = verified.payload;
 
     if (subPath === "wake") {
       const normalized = normalizeWakePayload(payload as Record<string, unknown>);

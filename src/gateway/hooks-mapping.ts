@@ -77,7 +77,30 @@ const hookPresetMappings: Record<string, HookMappingConfig[]> = {
   ],
 };
 
-const transformCache = new Map<string, HookTransformFn>();
+/**
+ * Context for custom auth verification in hook transforms.
+ * Similar to HookMappingContext but includes the raw body buffer
+ * for signature verification (e.g., GitHub HMAC signatures).
+ */
+export type HookVerifyAuthContext = {
+  headers: Record<string, string>;
+  url: URL;
+  path: string;
+  rawBody: Buffer;
+};
+
+/**
+ * Custom auth verification function exported by transform modules.
+ * Return true to allow the request, false to reject with 401.
+ */
+export type HookVerifyAuthFn = (ctx: HookVerifyAuthContext) => boolean | Promise<boolean>;
+
+type CachedTransform = {
+  transform: HookTransformFn;
+  verifyAuth?: HookVerifyAuthFn;
+};
+
+const transformCache = new Map<string, CachedTransform>();
 
 type HookTransformResult = Partial<{
   kind: HookAction["kind"];
@@ -293,14 +316,51 @@ function validateAction(action: HookAction): HookMappingResult {
   return { ok: true, action };
 }
 
-async function loadTransform(transform: HookMappingTransformResolved): Promise<HookTransformFn> {
+async function loadTransformModule(
+  transform: HookMappingTransformResolved,
+): Promise<CachedTransform> {
   const cached = transformCache.get(transform.modulePath);
   if (cached) return cached;
   const url = pathToFileURL(transform.modulePath).href;
   const mod = (await import(url)) as Record<string, unknown>;
   const fn = resolveTransformFn(mod, transform.exportName);
-  transformCache.set(transform.modulePath, fn);
-  return fn;
+  const verifyAuth =
+    typeof mod.verifyAuth === "function" ? (mod.verifyAuth as HookVerifyAuthFn) : undefined;
+  const result: CachedTransform = { transform: fn, verifyAuth };
+  transformCache.set(transform.modulePath, result);
+  return result;
+}
+
+async function loadTransform(transform: HookMappingTransformResolved): Promise<HookTransformFn> {
+  const cached = await loadTransformModule(transform);
+  return cached.transform;
+}
+
+/**
+ * Find the first mapping that matches the given path and has a custom verifyAuth function.
+ * Returns the verifyAuth function if found, null otherwise.
+ *
+ * This is called BEFORE normal token auth to allow mappings to implement
+ * custom authentication (e.g., GitHub webhook HMAC signatures).
+ */
+export async function findMappingVerifyAuth(
+  mappings: HookMappingResolved[],
+  subPath: string,
+): Promise<HookVerifyAuthFn | null> {
+  const normalizedPath = normalizeMatchPath(subPath);
+  for (const mapping of mappings) {
+    // Only match on path for pre-auth check (no payload available yet)
+    if (mapping.matchPath && mapping.matchPath !== normalizedPath) continue;
+    if (!mapping.matchPath && !mapping.matchSource) continue; // needs at least one matcher
+
+    if (mapping.transform) {
+      const mod = await loadTransformModule(mapping.transform);
+      if (mod.verifyAuth) {
+        return mod.verifyAuth;
+      }
+    }
+  }
+  return null;
 }
 
 function resolveTransformFn(mod: Record<string, unknown>, exportName?: string): HookTransformFn {
