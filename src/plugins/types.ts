@@ -264,6 +264,22 @@ export type OpenClawPluginApi = {
    * Use this for simple state-toggling or status commands that don't need AI reasoning.
    */
   registerCommand: (command: OpenClawPluginCommandDefinition) => void;
+  /**
+   * Register a custom webhook auth mode.
+   * Example:
+   * ```ts
+   * api.registerWebhookAuth("custom", {
+   *   createVerify: (config) => (ctx) => {
+   *     // your auth logic
+   *     return true;
+   *   }
+   * });
+   * ```
+   */
+  registerWebhookAuth: (
+    mode: string,
+    handler: import("../gateway/hooks.js").WebhookAuthMode,
+  ) => void;
   resolvePath: (input: string) => string;
   /** Register a lifecycle hook handler */
   on: <K extends PluginHookName>(

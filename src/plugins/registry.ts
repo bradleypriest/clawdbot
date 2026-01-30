@@ -33,6 +33,7 @@ import type { PluginRuntime } from "./runtime/types.js";
 import type { HookEntry } from "../hooks/types.js";
 import path from "node:path";
 import { normalizePluginHttpPath } from "./http-path.js";
+import { webhookAuthRegistry, type WebhookAuthMode } from "../gateway/webhook-auth-registry.js";
 
 export type PluginToolRegistration = {
   pluginId: string;
@@ -461,6 +462,38 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
     debug: logger.debug,
   });
 
+  const registerWebhookAuth = (record: PluginRecord, mode: string, handler: WebhookAuthMode) => {
+    const trimmed = mode.trim();
+    if (!trimmed) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: "webhook auth mode name cannot be empty",
+      });
+      return;
+    }
+    if (webhookAuthRegistry.has(trimmed)) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: `webhook auth mode already registered: ${trimmed}`,
+      });
+      return;
+    }
+    try {
+      webhookAuthRegistry.register(trimmed, handler);
+    } catch (err) {
+      pushDiagnostic({
+        level: "error",
+        pluginId: record.id,
+        source: record.source,
+        message: `webhook auth registration failed: ${String(err)}`,
+      });
+    }
+  };
+
   const createApi = (
     record: PluginRecord,
     params: {
@@ -489,6 +522,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       registerCli: (registrar, opts) => registerCli(record, registrar, opts),
       registerService: (service) => registerService(record, service),
       registerCommand: (command) => registerCommand(record, command),
+      registerWebhookAuth: (mode, handler) => registerWebhookAuth(record, mode, handler),
       resolvePath: (input: string) => resolveUserPath(input),
       on: (hookName, handler, opts) => registerTypedHook(record, hookName, handler, opts),
     };
