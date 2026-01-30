@@ -26,7 +26,8 @@ import {
   resolveHookChannel,
   resolveHookDeliver,
 } from "./hooks.js";
-import { applyHookMappings } from "./hooks-mapping.js";
+import { applyHookMappings, type HookMappingResolved } from "./hooks-mapping.js";
+import { readRawBody } from "./webhook-auth-registry.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
 import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
@@ -56,6 +57,37 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.end(JSON.stringify(body));
 }
 
+function parseJsonPayload(rawBody: Buffer): Record<string, unknown> {
+  const raw = rawBody.toString("utf-8").trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function findMatchingMapping(
+  mappings: HookMappingResolved[],
+  ctx: {
+    payload: Record<string, unknown>;
+    headers: Record<string, string>;
+    url: URL;
+    path: string;
+  },
+): HookMappingResolved | undefined {
+  for (const mapping of mappings) {
+    if (mapping.matchPath && mapping.matchPath !== ctx.path) continue;
+    if (mapping.matchSource) {
+      const source = typeof ctx.payload.source === "string" ? ctx.payload.source : undefined;
+      if (!source || source !== mapping.matchSource) continue;
+    }
+    return mapping;
+  }
+  return undefined;
+}
+
 export type HooksRequestHandler = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>;
 
 export function createHooksRequestHandler(
@@ -76,21 +108,6 @@ export function createHooksRequestHandler(
       return false;
     }
 
-    const { token, fromQuery } = extractHookToken(req, url);
-    if (!token || token !== hooksConfig.token) {
-      res.statusCode = 401;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Unauthorized");
-      return true;
-    }
-    if (fromQuery) {
-      logHooks.warn(
-        "Hook token provided via query parameter is deprecated for security reasons. " +
-          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
-          "Use Authorization: Bearer <token> or X-OpenClaw-Token header instead.",
-      );
-    }
-
     if (req.method !== "POST") {
       res.statusCode = 405;
       res.setHeader("Allow", "POST");
@@ -107,15 +124,80 @@ export function createHooksRequestHandler(
       return true;
     }
 
-    const body = await readJsonBody(req, hooksConfig.maxBodyBytes);
-    if (!body.ok) {
-      const status = body.error === "payload too large" ? 413 : 400;
-      sendJson(res, status, { ok: false, error: body.error });
+    // Read raw body first for auth (needed for HMAC signatures)
+    const rawBody = await readRawBody(req, hooksConfig.maxBodyBytes);
+    if (rawBody === null) {
+      sendJson(res, 413, { ok: false, error: "payload too large" });
       return true;
     }
 
-    const payload = typeof body.value === "object" && body.value !== null ? body.value : {};
     const headers = normalizeHookHeaders(req);
+
+    // Determine which auth to use
+    let authPassed = false;
+    let fromQuery = false;
+    let matchedMapping: HookMappingResolved | undefined;
+
+    // Check if this is a direct endpoint (wake/agent) or a mapping
+    if (subPath === "wake" || subPath === "agent") {
+      // Use global token auth for direct endpoints
+      const { token, fromQuery: isFromQuery } = extractHookToken(req, url);
+      fromQuery = isFromQuery;
+      authPassed = !!token && token === hooksConfig.token;
+    } else {
+      // Try to find a matching mapping for custom auth
+      if (hooksConfig.mappings.length > 0) {
+        // We need to parse the body to check mapping matches
+        const payload = parseJsonPayload(rawBody);
+        matchedMapping = findMatchingMapping(hooksConfig.mappings, {
+          payload,
+          headers,
+          url,
+          path: subPath,
+        });
+
+        if (matchedMapping?.authMode) {
+          // Use mapping-specific auth
+          try {
+            authPassed = await matchedMapping.authMode.verifyWebhook(
+              { headers, url, path: subPath, rawBody },
+              matchedMapping.authConfig ?? {},
+            );
+          } catch (err) {
+            logHooks.warn(`webhook auth verification failed: ${String(err)}`);
+            authPassed = false;
+          }
+        } else {
+          // Fall back to global token auth
+          const { token, fromQuery: isFromQuery } = extractHookToken(req, url);
+          fromQuery = isFromQuery;
+          authPassed = !!token && token === hooksConfig.token;
+        }
+      } else {
+        // No mappings, use global token auth
+        const { token, fromQuery: isFromQuery } = extractHookToken(req, url);
+        fromQuery = isFromQuery;
+        authPassed = !!token && token === hooksConfig.token;
+      }
+    }
+
+    if (!authPassed) {
+      res.statusCode = 401;
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.end("Unauthorized");
+      return true;
+    }
+
+    if (fromQuery) {
+      logHooks.warn(
+        "Hook token provided via query parameter is deprecated for security reasons. " +
+          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
+          "Use Authorization: Bearer <token> or X-OpenClaw-Token header instead.",
+      );
+    }
+
+    // Parse the body as JSON
+    const payload = parseJsonPayload(rawBody);
 
     if (subPath === "wake") {
       const normalized = normalizeWakePayload(payload as Record<string, unknown>);

@@ -3,6 +3,12 @@ import { pathToFileURL } from "node:url";
 
 import { CONFIG_PATH, type HookMappingConfig, type HooksConfig } from "../config/config.js";
 import type { HookMessageChannel } from "./hooks.js";
+import {
+  webhookAuthRegistry,
+  resolveAuthConfig,
+  type WebhookAuthContext,
+  type WebhookAuthMode,
+} from "./webhook-auth-registry.js";
 
 export type HookMappingResolved = {
   id: string;
@@ -22,6 +28,12 @@ export type HookMappingResolved = {
   thinking?: string;
   timeoutSeconds?: number;
   transform?: HookMappingTransformResolved;
+  /**
+   * Auth verifier function for this mapping.
+   * If undefined, falls back to global token auth.
+   */
+  authMode?: WebhookAuthMode;
+  authConfig?: Record<string, unknown>;
 };
 
 export type HookMappingTransformResolved = {
@@ -174,6 +186,17 @@ function normalizeHookMapping(
       }
     : undefined;
 
+  // Resolve auth configuration
+  const rawAuthConfig = mapping.auth ?? { mode: "token" };
+  const resolvedMode = webhookAuthRegistry.resolve(rawAuthConfig.mode);
+  if (!resolvedMode) {
+    throw new Error(
+      `webhook mapping "${id}": unknown auth mode "${rawAuthConfig.mode}". ` +
+        `Available modes: ${webhookAuthRegistry.listModes().join(", ")}`,
+    );
+  }
+  const resolvedAuthConfig = resolveAuthConfig(resolvedMode, rawAuthConfig);
+
   return {
     id,
     matchPath,
@@ -192,6 +215,8 @@ function normalizeHookMapping(
     thinking: mapping.thinking,
     timeoutSeconds: mapping.timeoutSeconds,
     transform,
+    authMode: resolvedMode,
+    authConfig: resolvedAuthConfig,
   };
 }
 

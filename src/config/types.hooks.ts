@@ -8,6 +8,11 @@ export type HookMappingTransform = {
   export?: string;
 };
 
+export type HookMappingAuthConfig = {
+  mode: string;
+  [key: string]: unknown;
+};
+
 export type HookMappingConfig = {
   id?: string;
   match?: HookMappingMatch;
@@ -36,6 +41,13 @@ export type HookMappingConfig = {
   thinking?: string;
   timeoutSeconds?: number;
   transform?: HookMappingTransform;
+  /**
+   * Authentication configuration for this webhook mapping.
+   * If omitted, defaults to { mode: "token" } using global hooks.token.
+   * Built-in modes: "token", "hmac", "none".
+   * Plugins can register custom modes via registerWebhookAuth.
+   */
+  auth?: HookMappingAuthConfig;
 };
 
 export type HooksGmailTailscaleMode = "off" | "serve" | "funnel";

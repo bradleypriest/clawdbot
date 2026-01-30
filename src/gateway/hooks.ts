@@ -5,6 +5,18 @@ import type { ChannelId } from "../channels/plugins/types.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
 import { type HookMappingResolved, resolveHookMappings } from "./hooks-mapping.js";
+import { registerBuiltinAuthModes } from "./webhook-auth-registry.js";
+
+// Re-export webhook auth types for external use
+export type {
+  WebhookAuthContext,
+  WebhookAuthVerifyFn,
+  WebhookAuthMode,
+} from "./webhook-auth-registry.js";
+export { webhookAuthRegistry } from "./webhook-auth-registry.js";
+
+// Register built-in auth modes on module load
+registerBuiltinAuthModes();
 
 const DEFAULT_HOOKS_PATH = "/hooks";
 const DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024;
