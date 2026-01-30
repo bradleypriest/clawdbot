@@ -40,6 +40,12 @@ export const HookMappingSchema = z
       })
       .strict()
       .optional(),
+    auth: z
+      .object({
+        mode: z.string(),
+      })
+      .passthrough()
+      .optional(),
   })
   .strict()
   .optional();

@@ -1,4 +1,5 @@
 import { CHANNEL_IDS } from "../channels/registry.js";
+import { webhookAuthRegistry } from "../gateway/webhook-auth-registry.js";
 import { VERSION } from "../version.js";
 import { OpenClawSchema } from "./zod-schema.js";
 
@@ -949,6 +950,33 @@ function stripChannelSchema(schema: ConfigSchema): ConfigSchema {
   return next;
 }
 
+/**
+ * Apply webhook auth mode configSchemas to the hooks.mappings[].auth field.
+ * Builds a oneOf from all registered modes that have a configSchema.
+ */
+function applyWebhookAuthSchemas(schema: ConfigSchema): ConfigSchema {
+  const modes = webhookAuthRegistry.entries();
+  const schemas = modes
+    .filter(([, mode]) => mode.configSchema)
+    .map(([, mode]) => mode.configSchema as JsonSchemaObject);
+  if (schemas.length === 0) return schema;
+
+  const next = cloneSchema(schema);
+  const root = asSchemaObject(next);
+  const hooksNode = asSchemaObject(root?.properties?.hooks);
+  const mappingsNode = hooksNode?.properties?.mappings;
+  if (!mappingsNode || typeof mappingsNode !== "object") return schema;
+
+  // mappings is an array — get the items schema
+  const arrayNode = mappingsNode as JsonSchemaObject;
+  const itemsNode = asSchemaObject(arrayNode.items as ConfigSchema | undefined);
+  if (!itemsNode?.properties) return schema;
+
+  // Replace the auth property with oneOf from registered modes
+  itemsNode.properties.auth = { oneOf: schemas };
+  return next;
+}
+
 function buildBaseConfigSchema(): ConfigSchemaResponse {
   if (cachedBase) return cachedBase;
   const schema = OpenClawSchema.toJSONSchema({
@@ -958,7 +986,7 @@ function buildBaseConfigSchema(): ConfigSchemaResponse {
   schema.title = "OpenClawConfig";
   const hints = applySensitiveHints(buildBaseHints());
   const next = {
-    schema: stripChannelSchema(schema),
+    schema: applyWebhookAuthSchemas(stripChannelSchema(schema)),
     uiHints: hints,
     version: VERSION,
     generatedAt: new Date().toISOString(),

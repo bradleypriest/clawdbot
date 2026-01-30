@@ -49,6 +49,11 @@ class WebhookAuthRegistry {
   listModes(): string[] {
     return Array.from(this.modes.keys());
   }
+
+  /** Return all registered modes with their metadata (for schema generation). */
+  entries(): Array<[string, WebhookAuthMode]> {
+    return Array.from(this.modes.entries());
+  }
 }
 
 export const webhookAuthRegistry = new WebhookAuthRegistry();
@@ -63,6 +68,14 @@ export const webhookAuthRegistry = new WebhookAuthRegistry();
  * If token is omitted, falls back to global hooks.token.
  */
 export const tokenAuthMode: WebhookAuthMode = {
+  configSchema: {
+    type: "object",
+    properties: {
+      mode: { type: "string", const: "token" },
+      token: { type: "string", description: "Override token (defaults to global hooks.token)" },
+    },
+    required: ["mode"],
+  },
   verifyWebhook: (ctx, config) => {
     const expectedToken = typeof config.token === "string" ? config.token.trim() : undefined;
     const providedToken = extractToken(ctx);
@@ -81,6 +94,22 @@ export const tokenAuthMode: WebhookAuthMode = {
  * Config: { mode: "hmac", header, secret, algorithm?, encoding?, prefix? }
  */
 export const hmacAuthMode: WebhookAuthMode = {
+  configSchema: {
+    type: "object",
+    properties: {
+      mode: { type: "string", const: "hmac" },
+      header: { type: "string", description: "Header containing the signature" },
+      secret: { type: "string", description: "Shared secret for HMAC computation" },
+      algorithm: { type: "string", description: "Hash algorithm (default: sha256)" },
+      encoding: {
+        type: "string",
+        enum: ["hex", "base64"],
+        description: "Signature encoding (default: hex)",
+      },
+      prefix: { type: "string", description: "Prefix to strip from signature header value" },
+    },
+    required: ["mode", "header", "secret"],
+  },
   defaults: {
     algorithm: "sha256",
     encoding: "hex",

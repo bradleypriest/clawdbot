@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { registerBuiltinAuthModes } from "../gateway/webhook-auth-registry.js";
 import { buildConfigSchema } from "./schema.js";
+
+registerBuiltinAuthModes();
 
 describe("config schema", () => {
   it("exports schema + hints", () => {
@@ -83,6 +86,24 @@ describe("config schema", () => {
     const channelSchema = channelsProps?.matrix as Record<string, unknown> | undefined;
     const channelProps = channelSchema?.properties as Record<string, unknown> | undefined;
     expect(channelProps?.accessToken).toBeTruthy();
+  });
+
+  it("applies webhook auth mode schemas to hooks.mappings[].auth", () => {
+    const res = buildConfigSchema();
+    const schema = res.schema as {
+      properties?: Record<
+        string,
+        { properties?: Record<string, { items?: { properties?: Record<string, unknown> } }> }
+      >;
+    };
+    const hooksNode = schema.properties?.hooks;
+    const mappingsNode = hooksNode?.properties?.mappings as
+      | { items?: { properties?: Record<string, unknown> } }
+      | undefined;
+    const itemProps = mappingsNode?.items?.properties;
+    const authField = itemProps?.auth as { oneOf?: unknown[] } | undefined;
+    expect(authField?.oneOf).toBeDefined();
+    expect(authField!.oneOf!.length).toBeGreaterThanOrEqual(2);
   });
 
   it("adds heartbeat target hints with dynamic channels", () => {
