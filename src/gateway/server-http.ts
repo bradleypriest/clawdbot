@@ -15,18 +15,19 @@ import { handleSlackHttpRequest } from "../slack/http/index.js";
 import { resolveAgentAvatar } from "../agents/identity-avatar.js";
 import { handleControlUiAvatarRequest, handleControlUiHttpRequest } from "./control-ui.js";
 import {
-  extractHookToken,
+  authenticateHook,
   getHookChannelError,
   type HookMessageChannel,
   type HooksConfigResolved,
   normalizeAgentPayload,
   normalizeHookHeaders,
   normalizeWakePayload,
-  readJsonBody,
+  parseJsonBody,
+  readRawBody,
   resolveHookChannel,
   resolveHookDeliver,
 } from "./hooks.js";
-import { applyHookMappings } from "./hooks-mapping.js";
+import { applyMapping, findMapping } from "./hooks-mapping.js";
 import { handleOpenAiHttpRequest } from "./openai-http.js";
 import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
@@ -76,21 +77,6 @@ export function createHooksRequestHandler(
       return false;
     }
 
-    const { token, fromQuery } = extractHookToken(req, url);
-    if (!token || token !== hooksConfig.token) {
-      res.statusCode = 401;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("Unauthorized");
-      return true;
-    }
-    if (fromQuery) {
-      logHooks.warn(
-        "Hook token provided via query parameter is deprecated for security reasons. " +
-          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
-          "Use Authorization: Bearer <token> or X-OpenClaw-Token header instead.",
-      );
-    }
-
     if (req.method !== "POST") {
       res.statusCode = 405;
       res.setHeader("Allow", "POST");
@@ -107,15 +93,58 @@ export function createHooksRequestHandler(
       return true;
     }
 
-    const body = await readJsonBody(req, hooksConfig.maxBodyBytes);
-    if (!body.ok) {
-      const status = body.error === "payload too large" ? 413 : 400;
-      sendJson(res, status, { ok: false, error: body.error });
+    const headers = normalizeHookHeaders(req);
+
+    // Read and parse body
+    const rawBody = await readRawBody(req, hooksConfig.maxBodyBytes);
+    if (!rawBody.ok) {
+      const status = rawBody.error === "payload too large" ? 413 : 400;
+      sendJson(res, status, { ok: false, error: rawBody.error });
+      return true;
+    }
+    const parsed = parseJsonBody(rawBody.value);
+    if (!parsed.ok) {
+      sendJson(res, 400, { ok: false, error: parsed.error });
       return true;
     }
 
-    const payload = typeof body.value === "object" && body.value !== null ? body.value : {};
-    const headers = normalizeHookHeaders(req);
+    const payload =
+      typeof parsed.value === "object" && parsed.value !== null
+        ? (parsed.value as Record<string, unknown>)
+        : {};
+
+    // Find matching mapping
+    const matched = findMapping(hooksConfig.mappings, { payload, headers, url, path: subPath });
+
+    // Authenticate (custom verify or token)
+    const auth = await authenticateHook({
+      req,
+      url,
+      subPath,
+      headers,
+      rawBody: rawBody.value,
+      transform: matched?.transform,
+      expectedToken: hooksConfig.token,
+    });
+
+    if (!auth.ok) {
+      if (auth.status === 401) {
+        res.statusCode = 401;
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.end("Unauthorized");
+      } else {
+        sendJson(res, auth.status, { ok: false, error: auth.error });
+      }
+      return true;
+    }
+
+    if (auth.tokenFromQuery) {
+      logHooks.warn(
+        "Hook token provided via query parameter is deprecated for security reasons. " +
+          "Tokens in URLs appear in logs, browser history, and referrer headers. " +
+          "Use Authorization: Bearer <token> or X-Moltbot-Token header instead.",
+      );
+    }
 
     if (subPath === "wake") {
       const normalized = normalizeWakePayload(payload as Record<string, unknown>);
@@ -139,9 +168,9 @@ export function createHooksRequestHandler(
       return true;
     }
 
-    if (hooksConfig.mappings.length > 0) {
+    if (matched) {
       try {
-        const mapped = await applyHookMappings(hooksConfig.mappings, {
+        const mapped = await applyMapping(matched, {
           payload: payload as Record<string, unknown>,
           headers,
           url,

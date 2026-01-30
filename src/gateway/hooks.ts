@@ -4,7 +4,13 @@ import { listChannelPlugins } from "../channels/plugins/index.js";
 import type { ChannelId } from "../channels/plugins/types.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
-import { type HookMappingResolved, resolveHookMappings } from "./hooks-mapping.js";
+import {
+  type HookMappingResolved,
+  type HookMappingTransformResolved,
+  type HookVerifyFn,
+  loadVerify,
+  resolveHookMappings,
+} from "./hooks-mapping.js";
 
 const DEFAULT_HOOKS_PATH = "/hooks";
 const DEFAULT_HOOKS_MAX_BODY_BYTES = 256 * 1024;
@@ -63,10 +69,10 @@ export function extractHookToken(req: IncomingMessage, url: URL): HookTokenResul
   return { token: undefined, fromQuery: false };
 }
 
-export async function readJsonBody(
+export async function readRawBody(
   req: IncomingMessage,
   maxBytes: number,
-): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
+): Promise<{ ok: true; value: Buffer } | { ok: false; error: string }> {
   return await new Promise((resolve) => {
     let done = false;
     let total = 0;
@@ -85,17 +91,7 @@ export async function readJsonBody(
     req.on("end", () => {
       if (done) return;
       done = true;
-      const raw = Buffer.concat(chunks).toString("utf-8").trim();
-      if (!raw) {
-        resolve({ ok: true, value: {} });
-        return;
-      }
-      try {
-        const parsed = JSON.parse(raw) as unknown;
-        resolve({ ok: true, value: parsed });
-      } catch (err) {
-        resolve({ ok: false, error: String(err) });
-      }
+      resolve({ ok: true, value: Buffer.concat(chunks) });
     });
     req.on("error", (err) => {
       if (done) return;
@@ -103,6 +99,97 @@ export async function readJsonBody(
       resolve({ ok: false, error: String(err) });
     });
   });
+}
+
+export function parseJsonBody(
+  raw: Buffer,
+): { ok: true; value: unknown } | { ok: false; error: string } {
+  const str = raw.toString("utf-8").trim();
+  if (!str) {
+    return { ok: true, value: {} };
+  }
+  try {
+    const parsed = JSON.parse(str) as unknown;
+    return { ok: true, value: parsed };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+export async function readJsonBody(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
+  const raw = await readRawBody(req, maxBytes);
+  if (!raw.ok) return raw;
+  return parseJsonBody(raw.value);
+}
+
+export type AuthenticateHookContext = {
+  req: IncomingMessage;
+  url: URL;
+  subPath: string;
+  headers: Record<string, string>;
+  rawBody: Buffer;
+  transform: HookMappingTransformResolved | undefined;
+  expectedToken: string;
+};
+
+export type AuthenticateHookResult =
+  | { ok: true; tokenFromQuery: boolean }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Authenticate a webhook request.
+ *
+ * If the mapping has a verify export, use custom auth.
+ * Otherwise, fall back to standard token auth.
+ */
+export async function authenticateHook(
+  ctx: AuthenticateHookContext,
+): Promise<AuthenticateHookResult> {
+  if (ctx.transform) {
+    const result = await verifyFromMapping(ctx.transform, ctx);
+    if (result) return result;
+  }
+  return verifyFromToken(ctx.req, ctx.url, ctx.expectedToken);
+}
+
+async function verifyFromMapping(
+  transform: HookMappingTransformResolved,
+  ctx: Pick<AuthenticateHookContext, "headers" | "url" | "subPath" | "rawBody">,
+): Promise<AuthenticateHookResult | undefined> {
+  let verify: HookVerifyFn | undefined;
+  try {
+    verify = await loadVerify(transform);
+  } catch (err) {
+    return { ok: false, status: 500, error: `Failed to load verify: ${String(err)}` };
+  }
+  if (!verify) return undefined;
+  try {
+    const ok = await verify({
+      headers: ctx.headers,
+      url: ctx.url,
+      path: ctx.subPath,
+      rawBody: ctx.rawBody,
+    });
+    if (!ok) return { ok: false, status: 401, error: "Unauthorized" };
+    return { ok: true, tokenFromQuery: false };
+  } catch (err) {
+    return { ok: false, status: 401, error: `verify error: ${String(err)}` };
+  }
+}
+
+function verifyFromToken(
+  req: IncomingMessage,
+  url: URL,
+  expectedToken: string,
+): AuthenticateHookResult {
+  const { token, fromQuery } = extractHookToken(req, url);
+  if (!token || token !== expectedToken) {
+    return { ok: false, status: 401, error: "Unauthorized" };
+  }
+  return { ok: true, tokenFromQuery: fromQuery };
 }
 
 export function normalizeHookHeaders(req: IncomingMessage) {

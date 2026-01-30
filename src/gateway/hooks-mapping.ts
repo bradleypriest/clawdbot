@@ -77,7 +77,30 @@ const hookPresetMappings: Record<string, HookMappingConfig[]> = {
   ],
 };
 
-const transformCache = new Map<string, HookTransformFn>();
+/**
+ * Context for custom auth verification in hook transforms.
+ * Similar to HookMappingContext but includes the raw body buffer
+ * for signature verification (e.g., GitHub HMAC signatures).
+ */
+export type HookVerifyContext = {
+  headers: Record<string, string>;
+  url: URL;
+  path: string;
+  rawBody: Buffer;
+};
+
+/**
+ * Custom auth verification function exported by transform modules.
+ * Return true to allow the request, false to reject with 401.
+ */
+export type HookVerifyFn = (ctx: HookVerifyContext) => boolean | Promise<boolean>;
+
+type CachedTransform = {
+  transform: HookTransformFn;
+  verify?: HookVerifyFn;
+};
+
+const transformCache = new Map<string, CachedTransform>();
 
 type HookTransformResult = Partial<{
   kind: HookAction["kind"];
@@ -129,32 +152,33 @@ export function resolveHookMappings(hooks?: HooksConfig): HookMappingResolved[] 
   return mappings.map((mapping, index) => normalizeHookMapping(mapping, index, transformsDir));
 }
 
-export async function applyHookMappings(
+export function findMapping(
   mappings: HookMappingResolved[],
   ctx: HookMappingContext,
-): Promise<HookMappingResult | null> {
-  if (mappings.length === 0) return null;
-  for (const mapping of mappings) {
-    if (!mappingMatches(mapping, ctx)) continue;
+): HookMappingResolved | undefined {
+  return mappings.find((m) => mappingMatches(m, ctx));
+}
 
-    const base = buildActionFromMapping(mapping, ctx);
-    if (!base.ok) return base;
+export async function applyMapping(
+  mapping: HookMappingResolved,
+  ctx: HookMappingContext,
+): Promise<HookMappingResult> {
+  const base = buildActionFromMapping(mapping, ctx);
+  if (!base.ok) return base;
 
-    let override: HookTransformResult = null;
-    if (mapping.transform) {
-      const transform = await loadTransform(mapping.transform);
-      override = await transform(ctx);
-      if (override === null) {
-        return { ok: true, action: null, skipped: true };
-      }
+  let override: HookTransformResult = null;
+  if (mapping.transform) {
+    const transform = await loadTransform(mapping.transform);
+    override = await transform(ctx);
+    if (override === null) {
+      return { ok: true, action: null, skipped: true };
     }
-
-    if (!base.action) return { ok: true, action: null, skipped: true };
-    const merged = mergeAction(base.action, override, mapping.action);
-    if (!merged.ok) return merged;
-    return merged;
   }
-  return null;
+
+  if (!base.action) return { ok: true, action: null, skipped: true };
+  const merged = mergeAction(base.action, override, mapping.action);
+  if (!merged.ok) return merged;
+  return merged;
 }
 
 function normalizeHookMapping(
@@ -293,14 +317,42 @@ function validateAction(action: HookAction): HookMappingResult {
   return { ok: true, action };
 }
 
-async function loadTransform(transform: HookMappingTransformResolved): Promise<HookTransformFn> {
+async function loadTransformModule(
+  transform: HookMappingTransformResolved,
+): Promise<CachedTransform> {
   const cached = transformCache.get(transform.modulePath);
   if (cached) return cached;
   const url = pathToFileURL(transform.modulePath).href;
   const mod = (await import(url)) as Record<string, unknown>;
-  const fn = resolveTransformFn(mod, transform.exportName);
-  transformCache.set(transform.modulePath, fn);
-  return fn;
+  const transformFn = resolveTransformFn(mod, transform.exportName);
+  const verify = resolveVerifyFn(mod);
+  const result: CachedTransform = { transform: transformFn, verify };
+  transformCache.set(transform.modulePath, result);
+  return result;
+}
+
+async function loadTransform(transform: HookMappingTransformResolved): Promise<HookTransformFn> {
+  const cached = await loadTransformModule(transform);
+  return cached.transform;
+}
+
+/**
+ * Load a transform module and return its verify export, if any.
+ */
+export async function loadVerify(
+  transform: HookMappingTransformResolved,
+): Promise<HookVerifyFn | undefined> {
+  const mod = await loadTransformModule(transform);
+  return mod.verify;
+}
+
+function resolveVerifyFn(mod: Record<string, unknown>): HookVerifyFn | undefined {
+  const candidate = mod.verify;
+  if (candidate == null) return undefined;
+  if (typeof candidate !== "function") {
+    throw new Error("hook verify export must be a function");
+  }
+  return candidate as HookVerifyFn;
 }
 
 function resolveTransformFn(mod: Record<string, unknown>, exportName?: string): HookTransformFn {

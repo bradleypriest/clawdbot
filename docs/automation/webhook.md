@@ -255,6 +255,91 @@ curl -X POST http://127.0.0.1:18789/hooks/gmail \
   -d '{"source":"gmail","messages":[{"from":"Ada","subject":"Hello","snippet":"Hi"}]}'
 ```
 
+## Custom Authentication (verify)
+
+External webhooks (GitHub, Stripe, Linear, etc.) often use their own authentication
+schemes (e.g., HMAC signatures). Instead of using the standard bearer token, you can
+export a `verify` function from your transform module to handle custom auth.
+
+When a mapping's transform module exports `verify`, it runs **before** the standard
+token check. If it returns `true`, the request is authorized; if `false`, a 401 is returned.
+
+### Example: GitHub Webhook Signature Verification
+
+The `verify` function receives a context with the raw body for signature verification:
+
+```typescript
+type HookVerifyContext = {
+  headers: Record<string, string>;   // Lowercase header names
+  url: URL;                          // Parsed request URL
+  path: string;                      // Subpath after /hooks/
+  rawBody: Buffer;                   // Raw request body for signature verification
+};
+```
+
+```javascript
+// hooks/github-transform.js
+import { createHmac, timingSafeEqual } from "crypto";
+
+// Runs BEFORE token auth - return true to allow, false to reject
+export function verify(ctx) {
+  const signature = ctx.headers["x-hub-signature-256"];
+  if (!signature) return false;
+  
+  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+  const expected = "sha256=" + createHmac("sha256", secret)
+    .update(ctx.rawBody)
+    .digest("hex");
+  
+  try {
+    return timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+// Transform the payload (runs after auth passes)
+export default function transform(ctx) {
+  const event = ctx.headers["x-github-event"];
+  
+  // Format based on event type
+  if (event === "push") {
+    return { message: `Push to ${ctx.payload.repository?.full_name}: ${ctx.payload.head_commit?.message}` };
+  }
+  if (event === "pull_request") {
+    return { message: `PR ${ctx.payload.action}: ${ctx.payload.pull_request?.title}` };
+  }
+  
+  return { message: `GitHub ${event}: ${JSON.stringify(ctx.payload).slice(0, 200)}` };
+}
+```
+
+Config:
+```yaml
+hooks:
+  enabled: true
+  token: "regular-token"  # Still needed for non-custom-auth hooks
+  mappings:
+    - id: github
+      match:
+        path: github
+      action: agent
+      name: GitHub
+      transform:
+        module: github-transform.js
+```
+
+### Async verify
+
+`verify` can be async if needed:
+
+```javascript
+export async function verify(ctx) {
+  // async validation (e.g., checking against external service)
+  return await validateSignature(ctx.headers, ctx.rawBody);
+}
+```
+
 ## Security
 
 - Keep hook endpoints behind loopback, tailnet, or trusted reverse proxy.

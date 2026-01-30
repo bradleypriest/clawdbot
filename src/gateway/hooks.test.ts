@@ -1,4 +1,5 @@
 import type { IncomingMessage } from "node:http";
+import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ChannelPlugin } from "../channels/plugins/types.js";
@@ -8,7 +9,10 @@ import {
   extractHookToken,
   normalizeAgentPayload,
   normalizeWakePayload,
+  parseJsonBody,
+  readRawBody,
   resolveHooksConfig,
+  authenticateHook,
 } from "./hooks.js";
 
 describe("gateway hooks helpers", () => {
@@ -149,4 +153,93 @@ const createMSTeamsPlugin = (params: { aliases?: string[] }): ChannelPlugin => (
     listAccountIds: () => [],
     resolveAccount: () => ({}),
   },
+});
+
+describe("readRawBody and parseJsonBody", () => {
+  test("readRawBody reads stream into buffer", async () => {
+    const req = Readable.from([
+      Buffer.from('{"foo":'),
+      Buffer.from('"bar"}'),
+    ]) as unknown as IncomingMessage;
+    const result = await readRawBody(req, 1024);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.toString()).toBe('{"foo":"bar"}');
+    }
+  });
+
+  test("parseJsonBody parses valid JSON", () => {
+    const result = parseJsonBody(Buffer.from('{"hello":"world"}'));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual({ hello: "world" });
+    }
+  });
+
+  test("parseJsonBody returns empty object for empty buffer", () => {
+    const result = parseJsonBody(Buffer.from(""));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual({});
+    }
+  });
+
+  test("parseJsonBody rejects invalid JSON", () => {
+    const result = parseJsonBody(Buffer.from("not json"));
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("authenticateHook", () => {
+  function createMockRequest(headers: Record<string, string> = {}): IncomingMessage {
+    return { headers } as unknown as IncomingMessage;
+  }
+
+  test("valid token succeeds", async () => {
+    const result = await authenticateHook({
+      req: createMockRequest({ authorization: "Bearer secret123" }),
+      url: new URL("http://localhost/hooks/test"),
+      subPath: "test",
+      headers: { authorization: "Bearer secret123" },
+      rawBody: Buffer.from("{}"),
+      transform: undefined,
+      expectedToken: "secret123",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.tokenFromQuery).toBe(false);
+    }
+  });
+
+  test("invalid token fails", async () => {
+    const result = await authenticateHook({
+      req: createMockRequest({ authorization: "Bearer wrong" }),
+      url: new URL("http://localhost/hooks/test"),
+      subPath: "test",
+      headers: { authorization: "Bearer wrong" },
+      rawBody: Buffer.from("{}"),
+      transform: undefined,
+      expectedToken: "secret123",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(401);
+    }
+  });
+
+  test("query token sets tokenFromQuery", async () => {
+    const result = await authenticateHook({
+      req: createMockRequest({}),
+      url: new URL("http://localhost/hooks/test?token=secret123"),
+      subPath: "test",
+      headers: {},
+      rawBody: Buffer.from("{}"),
+      transform: undefined,
+      expectedToken: "secret123",
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.tokenFromQuery).toBe(true);
+    }
+  });
 });

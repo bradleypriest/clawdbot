@@ -3,7 +3,24 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { applyHookMappings, resolveHookMappings } from "./hooks-mapping.js";
+import {
+  applyMapping,
+  findMapping,
+  type HookMappingContext,
+  type HookMappingResult,
+  loadVerify,
+  resolveHookMappings,
+} from "./hooks-mapping.js";
+
+/** Test helper: find first matching mapping and apply it. */
+async function applyFirstMatch(
+  mappings: ReturnType<typeof resolveHookMappings>,
+  ctx: HookMappingContext,
+): Promise<HookMappingResult | null> {
+  const matched = findMapping(mappings, ctx);
+  if (!matched) return null;
+  return applyMapping(matched, ctx);
+}
 
 const baseUrl = new URL("http://127.0.0.1:18789/hooks/gmail");
 
@@ -25,7 +42,7 @@ describe("hooks mapping", () => {
         },
       ],
     });
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: { messages: [{ subject: "Hello" }] },
       headers: {},
       url: baseUrl,
@@ -50,7 +67,7 @@ describe("hooks mapping", () => {
         },
       ],
     });
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: { messages: [{ subject: "Hello" }] },
       headers: {},
       url: baseUrl,
@@ -82,7 +99,7 @@ describe("hooks mapping", () => {
       ],
     });
 
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: { name: "Ada" },
       headers: {},
       url: new URL("http://127.0.0.1:18789/hooks/custom"),
@@ -114,7 +131,7 @@ describe("hooks mapping", () => {
       ],
     });
 
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: {},
       headers: {},
       url: new URL("http://127.0.0.1:18789/hooks/skip"),
@@ -140,7 +157,7 @@ describe("hooks mapping", () => {
         },
       ],
     });
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: { messages: [{ subject: "Hello" }] },
       headers: {},
       url: baseUrl,
@@ -157,12 +174,82 @@ describe("hooks mapping", () => {
     const mappings = resolveHookMappings({
       mappings: [{ match: { path: "noop" }, action: "agent" }],
     });
-    const result = await applyHookMappings(mappings, {
+    const result = await applyFirstMatch(mappings, {
       payload: {},
       headers: {},
       url: new URL("http://127.0.0.1:18789/hooks/noop"),
       path: "noop",
     });
     expect(result?.ok).toBe(false);
+  });
+});
+
+describe("loadVerify", () => {
+  it("returns undefined when transform has no verify export", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moltbot-hooks-noauth-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(modPath, "export default () => ({ message: 'test' });");
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await loadVerify(mappings[0]!.transform!);
+    expect(result).toBeUndefined();
+  });
+
+  it("returns verify function when exported", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "moltbot-hooks-auth-"));
+    const modPath = path.join(dir, "transform.mjs");
+    fs.writeFileSync(
+      modPath,
+      `
+      export function verify(ctx) {
+        return ctx.headers["x-secret"] === "valid";
+      }
+      export default () => ({ message: 'test' });
+      `,
+    );
+
+    const mappings = resolveHookMappings({
+      transformsDir: dir,
+      mappings: [
+        {
+          match: { path: "github" },
+          action: "agent",
+          transform: { module: "transform.mjs" },
+        },
+      ],
+    });
+
+    const result = await loadVerify(mappings[0]!.transform!);
+    expect(result).toBeDefined();
+    expect(typeof result).toBe("function");
+
+    // Test the verify function works
+    if (result) {
+      const valid = await result({
+        headers: { "x-secret": "valid" },
+        url: new URL("http://localhost/hooks/github"),
+        path: "github",
+        rawBody: Buffer.from("{}"),
+      });
+      expect(valid).toBe(true);
+
+      const invalid = await result({
+        headers: { "x-secret": "wrong" },
+        url: new URL("http://localhost/hooks/github"),
+        path: "github",
+        rawBody: Buffer.from("{}"),
+      });
+      expect(invalid).toBe(false);
+    }
   });
 });
